@@ -1,0 +1,337 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from rembg import remove
+from PIL import Image
+from skimage.color import deltaE_ciede2000
+
+# ==========================================
+# 1. جدا کردن نان از پس‌زمینه
+# ==========================================
+def segment_bread(img):
+
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(img_rgb)
+
+    output = remove(pil_img)
+    output_np = np.array(output)
+
+    if len(output_np.shape) == 3 and output_np.shape[2] == 4:
+        alpha = output_np[:, :, 3]
+    else:
+        gray = cv2.cvtColor(output_np[:, :, :3], cv2.COLOR_RGB2GRAY)
+        _, alpha = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+
+    kernel = np.ones((5, 5), np.uint8)
+
+    alpha = cv2.morphologyEx(
+        alpha,
+        cv2.MORPH_CLOSE,
+        kernel,
+        iterations=2
+    )
+
+    alpha = cv2.morphologyEx(
+        alpha,
+        cv2.MORPH_OPEN,
+        kernel,
+        iterations=1
+    )
+     contours, _ = cv2.findContours(
+        alpha,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    if contours:
+
+        clean_mask = np.zeros_like(alpha)
+
+        for cnt in contours:
+
+            area = cv2.contourArea(cnt)
+
+            if area > 1000:
+
+                cv2.drawContours(
+                    clean_mask,
+                    [cnt],
+                    -1,
+                    255,
+                    -1
+                )
+
+        return clean_mask
+
+    return alpha
+
+
+# ==========================================
+# 2. تشخیص سوختگی
+# ==========================================
+def analyze_burnt(img, mask):
+
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2Lab)
+    L_channel = lab[:, :, 0]
+
+    bread_pixels = L_channel[mask == 255]
+
+    if len(bread_pixels) == 0:
+        return np.zeros_like(L_channel, dtype=np.uint8), 0.0
+  burnt_threshold = np.percentile(
+        bread_pixels,
+        5
+    )
+
+    burnt_mask = np.zeros_like(
+        L_channel,
+        dtype=np.uint8
+    )
+
+    burnt_mask[
+        (L_channel < burnt_threshold)
+        & (mask == 255)
+    ] = 255
+
+    kernel = np.ones((3, 3), np.uint8)
+
+    burnt_mask = cv2.morphologyEx(
+        burnt_mask,
+        cv2.MORPH_OPEN,
+        kernel
+    )
+
+    bread_area = np.sum(mask == 255)
+
+    burnt_percent = (
+        np.sum(burnt_mask == 255)
+        / bread_area
+    ) * 100 if bread_area > 0 else 0
+
+    return burnt_mask, burnt_percent
+
+
+# ==========================================
+# 3. مقایسه با مرجع
+# ==========================================
+def compare_with_reference(
+    img_test,
+    mask_test,
+    burnt_mask,
+    bread_type
+):
+
+    ref_path = f"references/{bread_type}.jpg"
+
+    if not os.path.exists(ref_path):
+        print(f"فایل مرجع پیدا نشد: {ref_path}")
+        return None, None, None
+
+    img_ref = cv2.imread(ref_path)
+
+    if img_ref is None:
+        print(f"خطا در خواندن فایل مرجع: {ref_path}")
+        return None, None, None
+
+    mask_ref = segment_bread(img_ref)
+
+    lab_ref = cv2.cvtColor(
+        img_ref,
+        cv2.COLOR_BGR2Lab
+    ).astype(np.float32)
+
+    lab_test = cv2.cvtColor(
+        img_test,
+        cv2.COLOR_BGR2Lab
+    ).astype(np.float32)
+
+    ref_pixels = lab_ref[mask_ref == 255]
+
+    if len(ref_pixels) == 0:
+        print("ماسک مرجع خالی است")
+        return None, None, None
+
+    healthy_mask = cv2.bitwise_and(
+        mask_test,
+        cv2.bitwise_not(burnt_mask)
+    )
+
+    test_pixels = lab_test[healthy_mask == 255]
+
+    if len(test_pixels) == 0:
+        print("ناحیه سالمی برای مقایسه وجود ندارد")
+      return None, None, None
+
+    mean_ref = np.mean(ref_pixels, axis=0)
+    mean_test = np.mean(test_pixels, axis=0)
+
+    delta_e = deltaE_ciede2000(
+        mean_ref.reshape(1, 1, 3),
+        mean_test.reshape(1, 1, 3)
+    )[0, 0]
+
+    return delta_e, mean_ref, mean_test
+
+
+# ==========================================
+# 4. تفسیر کیفیت
+# ==========================================
+def interpret_quality(delta_e, bread_type):
+
+    thresholds = {
+        "lavash": (3.0, 9.0),
+        "taftoon": (4.0, 12.0),
+        "sangak": (5.0, 15.0),
+        "barbari": (4.5, 15.0)
+    }
+
+    good, acceptable = thresholds.get(
+        bread_type,
+        (5.0, 10.0)
+    )
+
+    if delta_e < good:
+        return f"عالی (مشابه {bread_type})"
+    elif delta_e < acceptable:
+        return "قابل قبول"
+    else:
+        return "نامطلوب"
+
+
+# ==========================================
+# اجرای اصلی
+# ==========================================
+if __name__ == "__main__":
+
+    print("=" * 60)
+    print("تحلیلگر هوشمند کیفیت نان")
+    print("=" * 60)
+
+    valid_types = [
+        "lavash",
+        "taftoon",
+        "sangak",
+        "barbari"
+    ]
+
+    bread_type = input(
+        "نوع نان را وارد کنید: "
+    ).strip().lower()
+
+    if bread_type not in valid_types:
+        print("نوع نان نامعتبر است")
+        raise SystemExit
+
+    image_path = "my_bread.jpg"
+
+    if not os.path.exists(image_path):
+        print(f"فایل پیدا نشد: {image_path}")
+        raise SystemExit
+
+    img_test = cv2.imread(image_path)
+
+    if img_test is None:
+        print("خطا در خواندن تصویر")
+        raise SystemExit
+
+    lab = cv2.cvtColor(
+        img_test,
+        cv2.COLOR_BGR2Lab
+    )
+
+    L, a, b = cv2.split(lab)
+
+    L = cv2.equalizeHist(L)
+ lab = cv2.merge([L, a, b])
+
+    img_test = cv2.cvtColor(
+        lab,
+        cv2.COLOR_Lab2BGR
+    )
+
+    print("در حال جداسازی نان...")
+
+    mask_test = segment_bread(img_test)
+
+    print("در حال تحلیل سوختگی...")
+
+    burnt_mask, burnt_percent = analyze_burnt(
+        img_test,
+        mask_test
+    )
+
+    img_with_burnt = img_test.copy()
+
+    img_with_burnt[burnt_mask == 255] = [0, 0, 255]
+
+    delta_e, mean_ref, mean_test = compare_with_reference(
+        img_test,
+        mask_test,
+        burnt_mask,
+        bread_type
+    )
+
+    print("\\nنتایج تحلیل")
+    print("-" * 40)
+    print(f"نوع نان: {bread_type}")
+    print(f"درصد سوختگی: {burnt_percent:.2f}%")
+
+    if delta_e is not None:
+        print(f"فاصله رنگی ΔE2000: {delta_e:.2f}")
+        print(f"کیفیت: {interpret_quality(delta_e, bread_type)}")
+
+    plt.figure(figsize=(18, 6))
+
+plt.subplot(1, 4, 1)
+
+    ref_path = f"references/{bread_type}.jpg"
+
+    if os.path.exists(ref_path):
+
+        img_ref = cv2.imread(ref_path)
+
+        plt.imshow(
+            cv2.cvtColor(
+                img_ref,
+                cv2.COLOR_BGR2RGB
+            )
+        )
+
+        plt.title("Reference")
+
+    plt.axis("off")
+
+    plt.subplot(1, 4, 2)
+
+    plt.imshow(
+        cv2.cvtColor(
+            img_test,
+            cv2.COLOR_BGR2RGB
+        )
+    )
+
+    plt.title("Sample")
+    plt.axis("off")
+
+    plt.subplot(1, 4, 3)
+
+    plt.imshow(mask_test, cmap="gray")
+    plt.title("Mask")
+    plt.axis("off")
+
+    plt.subplot(1, 4, 4)
+
+    plt.imshow(
+        cv2.cvtColor(
+            img_with_burnt,
+            cv2.COLOR_BGR2RGB
+        )
+    )
+
+    plt.title(f"Burnt {burnt_percent:.1f}%")
+    plt.axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
